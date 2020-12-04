@@ -42,7 +42,7 @@ class Executor:
         """Run the callback and store the result."""
         result = func()
         self.thread_results[field] = (
-            result if result is None else style_as_faded(result)
+            result if result is None else style_as_faded(str(result))
         )
         return result
 
@@ -50,7 +50,13 @@ class Executor:
 class AsyncPrompt:
     """Represent an asynchronous prompt."""
 
-    def __init__(self, name: str, session: PromptSession, executor: Executor):
+    def __init__(
+        self,
+        name: str,
+        session: PromptSession,
+        executor: Executor,
+        updator: "PromptUpdator",
+    ):
         """
 
         Parameters
@@ -68,11 +74,18 @@ class AsyncPrompt:
         self.timer = None
         self.session = session
         self.executor = executor
+        self.updator = updator
 
         # (Key: the future object) that is created for the (value: index/field_name) in the tokens list
         self.futures: tp.Dict[
             concurrent.futures.Future,
-            tp.Tuple[str, tp.Optional[int], tp.Optional[str], tp.Optional[str]],
+            tp.Tuple[
+                str,
+                tp.Optional[int],
+                tp.Optional[str],
+                tp.Optional[str],
+                tp.Optional[str],
+            ],
         ] = {}
 
     def start_update(self, on_complete):
@@ -88,7 +101,16 @@ class AsyncPrompt:
         if not self.tokens:
             print(f"Warn: AsyncPrompt is created without tokens - {self.name}")
             return
-        for fut in concurrent.futures.as_completed(self.futures):
+        while len(self.futures) > 0:
+            finished, _ = concurrent.futures.wait(
+                self.futures, 0.1, concurrent.futures.FIRST_COMPLETED
+            )
+
+            # timeout
+            if len(finished) == 0:
+                continue
+
+            fut = finished.pop()
             val = fut.result()
 
             if fut not in self.futures:
@@ -96,8 +118,17 @@ class AsyncPrompt:
                 # because new prompt is called
                 continue
 
-            placeholder, idx, spec, conv = self.futures[fut]
-            # example: placeholder="{field}", idx=10, spec="env: {}"
+            placeholder, idx, spec, conv, field = self.futures[fut]
+            # example: placeholder="{field}", idx=10, spec="env: {}", field="field"
+            del self.futures[fut]
+
+            # check if return value has an updater
+            if hasattr(val, "updater"):
+                func = val.updater
+                val = str(val)
+                # resubmit returned func for dynamic update
+                if self in self.updator.prompts.values():
+                    self.submit_section(func, field, idx, spec, conv)
 
             if isinstance(idx, int):
                 self.tokens.update(idx, val, spec, conv)
@@ -149,7 +180,7 @@ class AsyncPrompt:
         conv=None,
     ):
         future, intermediate_value, placeholder = self.executor.submit(func, field)
-        self.futures[future] = (placeholder, idx, spec, conv)
+        self.futures[future] = (placeholder, idx, spec, conv, field)
         return intermediate_value
 
 
@@ -157,7 +188,9 @@ class PromptUpdator:
     """Handle updating multiple AsyncPrompt instances prompt/rprompt/bottom_toolbar"""
 
     def __init__(self, session: PromptSession):
-        self.prompts: tp.Dict[str, AsyncPrompt] = {}
+        self.prompts: tp.Dict[
+            str, AsyncPrompt
+        ] = {}  # TODO refactor this to a list, AsyncPrompts should know their name
         self.prompter = session
         self.executor = Executor()
 
@@ -170,7 +203,7 @@ class PromptUpdator:
             self.stop(prompt_name)
 
         self.prompts[prompt_name] = AsyncPrompt(
-            prompt_name, self.prompter, self.executor
+            prompt_name, self.prompter, self.executor, self
         )
         return self.prompts[prompt_name]
 
